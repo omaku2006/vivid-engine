@@ -17,7 +17,8 @@ use ipc::{IpcCommand, try_connect, start_listener};
 
 fn print_animation_list() {
     println!("🎬 Available Animations:");
-    println!("  • fade • wipe • split • center • outer • pixel • dissolve • glitch • random");
+    println!("  • fade • wipe • split • center • outer • pixel • dissolve • glitch");
+    println!("  • slide_up • slide_down • zoom • blinds • diagonal • wave • random");
     println!("\n⏱️  Duration: -a 0.1 to 3.0 (seconds)");
     println!("💡 Usage:\n   vivid-engine                    # Start daemon\n   vivid-engine /path.jpg        # Change wallpaper\n   vivid-engine -a center -a 1.0 # Set anim + duration");
 }
@@ -31,7 +32,6 @@ fn main() {
         }
     }
 
-    // ✅ CLIENT MODE
     if args.file.is_some() || args.animation.is_some() {
         if try_connect().is_some() {
             let cfg = config::load();
@@ -60,26 +60,21 @@ fn main() {
         }
     }
 
-    // ✅ DAEMON MODE
     println!("🚀 Starting Vivid Engine daemon...");
     let mut engine = match WallpaperEngine::new() {
         Ok(e) => e,
         Err(e) => { eprintln!("❌ Wayland init failed: {}", e); std::process::exit(1); }
     };
 
-    // Load saved wallpaper
     let cfg = config::load();
     if let Some(path) = &cfg.last_wallpaper {
         if std::path::Path::new(path).exists() {
-            // ✅ FIX: Call setup_surface explicitly if needed
-            if engine.state.surface.is_none() {
-                let _ = engine.setup_surface();
-            }
+            let anim = AnimationType::from_name(&cfg.animation);
             
+            // ✅ FIX: Video start thayya pachhi transition show thay!
             if WallpaperEngine::is_video(path) {
-                engine.start_video_thread(path);
+                engine.start_video_with_transition(path, anim, cfg.duration);
             } else {
-                let anim = AnimationType::from_name(&cfg.animation);
                 let _ = engine.display_with_animation(path, anim, cfg.duration);
             }
         }

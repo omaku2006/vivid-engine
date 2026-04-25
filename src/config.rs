@@ -2,18 +2,19 @@ use std::fs;
 use std::path::PathBuf;
 
 pub const ANIMATIONS: &[&str] = &[
-    "fade", "wipe", "split", "center", "outer", "pixel", "dissolve", "glitch", "random"
+    "fade", "wipe", "split", "center", "outer", "pixel", "dissolve", "glitch",
+    "slide_up", "slide_down", "zoom", "blinds", "diagonal", "wave", "random"
 ];
 
-pub const DEFAULT_DURATION: f32 = 0.5; // 0.5 seconds default
-pub const MIN_DURATION: f32 = 0.1;     // 100ms minimum
-pub const MAX_DURATION: f32 = 3.0;     // 3 seconds maximum
+pub const DEFAULT_DURATION: f32 = 0.5;
+pub const MIN_DURATION: f32 = 0.1;
+pub const MAX_DURATION: f32 = 3.0;
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub last_wallpaper: Option<String>,
     pub animation: String,
-    pub duration: f32, // in seconds
+    pub duration: f32,
 }
 
 fn config_dir() -> PathBuf {
@@ -52,18 +53,12 @@ pub fn save(wallpaper: &str, animation: &str, duration: f32) {
     fs::create_dir_all(&dir).ok();
     
     let content = format!(
-        "# Vivid Engine Config\n\
-         LAST_WALLPAPER={}\n\
-         ANIMATION={}\n\
-         DURATION={:.2}\n",
-        wallpaper, 
-        animation.to_lowercase(), 
-        duration.clamp(MIN_DURATION, MAX_DURATION)
+        "# Vivid Engine Config\nLAST_WALLPAPER={}\nANIMATION={}\nDURATION={:.2}\n",
+        wallpaper, animation.to_lowercase(), duration.clamp(MIN_DURATION, MAX_DURATION)
     );
     fs::write(dir.join("state.conf"), content).ok();
 }
 
-// Helper: Check if string is a valid duration number
 pub fn is_duration_str(s: &str) -> bool {
     s.parse::<f32>().is_ok()
 }
