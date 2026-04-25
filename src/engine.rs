@@ -71,6 +71,7 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for AppState {
         }
     }
 }
+
 impl Dispatch<wl_compositor::WlCompositor, ()> for AppState { fn event(_: &mut Self, _: &wl_compositor::WlCompositor, _: <wl_compositor::WlCompositor as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {} }
 impl Dispatch<wl_shm::WlShm, ()> for AppState { fn event(_: &mut Self, _: &wl_shm::WlShm, _: <wl_shm::WlShm as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {} }
 impl Dispatch<wl_shm_pool::WlShmPool, ()> for AppState { fn event(_: &mut Self, _: &wl_shm_pool::WlShmPool, _: <wl_shm_pool::WlShmPool as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {} }
@@ -89,8 +90,6 @@ pub struct WallpaperEngine {
     pub video_buffer: Arc<Mutex<Option<Vec<u8>>>>,
     video_thread: Option<thread::JoinHandle<()>>,
     video_shm_buffer: Option<(memmap2::MmapMut, wl_buffer::WlBuffer)>,
-    
-    // 🛑 FIX: PID nathi, Direct Child Process Store karo!
     video_child: Option<Child>,
 }
 
@@ -117,7 +116,7 @@ impl WallpaperEngine {
             video_buffer: Arc::new(Mutex::new(None)),
             video_thread: None,
             video_shm_buffer: None,
-            video_child: None, // ✅ Initialized
+            video_child: None,
         })
     }
 
@@ -183,7 +182,7 @@ impl WallpaperEngine {
         let mut out = child.stdout.take()?;
         let mut buf = vec![0u8; (w * h * 4) as usize];
         if out.read_exact(&mut buf).is_err() { return None; }
-        let _ = child.wait(); // ✅ Reap 1st frame process
+        let _ = child.wait();
         Some(buf)
     }
 
@@ -249,7 +248,6 @@ impl WallpaperEngine {
             Err(e) => { eprintln!("❌ Failed to start ffmpeg: {}", e); return; }
         };
 
-        // ✅ FIX: stdout thread ma move karo, Child object struct ma store karo!
         let out = child.stdout.take().expect("Failed to capture stdout");
         self.video_child = Some(child);
 
@@ -261,12 +259,14 @@ impl WallpaperEngine {
             loop {
                 if out.read_exact(&mut frame).is_err() { break; }
                 *buf.lock().unwrap() = Some(frame.clone());
-                thread::sleep(Duration::from_millis(16));
+                // ✅ FIX: Sleep REMOVED! FFmpeg -re handles pacing smoothly natively.
+                // Extra sleep was causing micro-jerk at loop points!
             }
         }));
     }
 
     pub fn render_video_frame(&mut self) {
+        // ✅ FIX: Simple, blind render. No VSync deadlock!
         let frame_opt = self.video_buffer.lock().unwrap().take();
         if frame_opt.is_none() { return; }
         
@@ -276,6 +276,7 @@ impl WallpaperEngine {
                 self.video_shm_buffer = Some(buf);
             } else { return; }
         }
+        
         if let Some((ref mut mmap, ref buf)) = self.video_shm_buffer {
             mmap.copy_from_slice(&frame_data);
             if let Some(surf) = self.state.surface.as_ref() {
@@ -294,20 +295,16 @@ impl WallpaperEngine {
             IpcCommand::SetWallpaper { path, animation, duration } => {
                 if !std::path::Path::new(&path).exists() { return "❌ File not found".to_string(); }
                 
-                // 🛑 PROPER KILL: Child object handle kare chhe, 100% guaranteed kill
                 if let Some(mut child) = self.video_child.take() {
-                    eprintln!("🛑 Stopping old video...");
-                    let _ = child.kill(); // Sends SIGKILL directly via OS
-                    let _ = child.wait(); // Reaps zombie process (CPU loop防ぐ)
-                    
-                    // Wait for thread to realize pipe is broken and exit
+                    let _ = child.kill();
+                    let _ = child.wait();
                     if let Some(handle) = self.video_thread.take() {
                         let _ = handle.join();
                     }
                 }
                 
                 *self.video_buffer.lock().unwrap() = None;
-                self.video_shm_buffer = None; // Clean up old buffer memory
+                self.video_shm_buffer = None;
 
                 let anim = AnimationType::from_name(&animation);
                 if Self::is_video(&path) {
