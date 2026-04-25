@@ -1,0 +1,17 @@
+# 🔥 Rust Build Artifacts (Never push these!)
+/target/
+**/*.rs.bk
+
+# 💻 IDE & Editor Junk
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 🍎🪟 OS Files
+.DS_Store
+Thumbs.db
+
+# 📝 Project Temp Files
+FULL_PROJECT_CODE.txt
