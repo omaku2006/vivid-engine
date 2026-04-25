@@ -1,0 +1,1239 @@
+PROJECT CODE MERGE
+========================================
+
+
+======================================================================
+📂 FILE: ./README.md
+======================================================================
+
+# Vivid Engine
+
+A low-resource wallpaper engine for Wayland, supporting images and videos (including MP4) as wallpapers.
+
+## Features
+
+- Low CPU, GPU, and RAM utilization
+- Supports static images and video wallpapers
+- Per-workspace wallpaper support (for compositors like Niri)
+- Uses Wayland layer-shell for efficient rendering
+
+## Building
+
+```bash
+cargo build --release
+```
+
+## Running
+
+```bash
+cargo run --release
+```
+
+## Configuration
+
+Configuration will be added via command-line arguments or a config file in the future.
+
+## License
+
+MIT
+
+======================================================================
+📂 FILE: ./Cargo.toml
+======================================================================
+
+[package]
+name = "vivid-engine"
+version = "0.4.0"
+edition = "2021"
+
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+clap = { version = "4.5", features = ["derive"] }
+memmap2 = "0.9"
+tempfile = "3"
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+
+======================================================================
+📂 FILE: ./src/ipc.rs
+======================================================================
+
+use std::fs;
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+
+pub const SOCKET_PATH: &str = "/tmp/vivid-engine.sock";
+
+#[derive(Debug, Clone)]
+pub enum IpcCommand {
+    SetWallpaper { path: String, animation: String, duration: f32 },
+    SetAnimation { name: String },
+    SetDuration { seconds: f32 },
+    GetStatus,
+}
+
+impl IpcCommand {
+    pub fn parse(s: &str) -> Option<Self> {
+        let parts: Vec<&str> = s.trim().split('|').collect();
+        match parts.first().map(|s| *s) {
+            Some("SET_WALLPAPER") if parts.len() >= 4 => Some(IpcCommand::SetWallpaper {
+                path: parts[1].to_string(),
+                animation: parts[2].to_string(),
+                duration: parts[3].parse().ok()?,
+            }),
+            Some("SET_ANIMATION") if parts.len() >= 2 => Some(IpcCommand::SetAnimation { name: parts[1].to_string() }),
+            Some("SET_DURATION") if parts.len() >= 2 => Some(IpcCommand::SetDuration { seconds: parts[1].parse().ok()? }),
+            Some("GET_STATUS") => Some(IpcCommand::GetStatus),
+            _ => None,
+        }
+    }
+    pub fn serialize(&self) -> String {
+        match self {
+            IpcCommand::SetWallpaper { path, animation, duration } => format!("SET_WALLPAPER|{}|{}|{:.2}", path, animation, duration),
+            IpcCommand::SetAnimation { name } => format!("SET_ANIMATION|{}", name),
+            IpcCommand::SetDuration { seconds } => format!("SET_DURATION|{:.2}", seconds),
+            IpcCommand::GetStatus => "GET_STATUS".to_string(),
+        }
+    }
+}
+
+pub fn send_command(cmd: &IpcCommand) -> Result<String, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(SOCKET_PATH)?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(3)))?;
+
+    let mut writer = BufWriter::new(&stream);
+    writer.write_all(cmd.serialize().as_bytes())?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+
+    let mut reader = BufReader::new(&stream);
+    let mut response = String::new();
+    reader.read_line(&mut response)?;
+    Ok(response.trim().to_string())
+}
+
+pub fn start_listener() -> Result<UnixListener, Box<dyn std::error::Error>> {
+    let _ = fs::remove_file(SOCKET_PATH);
+    let listener = UnixListener::bind(SOCKET_PATH)?;
+    listener.set_nonblocking(true).ok(); // ✅ Non-blocking accept
+    fs::set_permissions(SOCKET_PATH, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    Ok(listener)
+}
+
+pub fn try_connect() -> Option<UnixStream> {
+    UnixStream::connect(SOCKET_PATH).ok()
+}
+
+
+======================================================================
+📂 FILE: ./src/main.rs
+======================================================================
+
+use clap::Parser;
+use std::thread;
+use std::time::Duration;
+use std::io::{BufRead, BufReader, BufWriter, Write}; // ✅ Added Write trait
+use std::os::unix::net::UnixListener;
+
+// ✅ DECLARE MODULES (MUST come before `use`)
+mod args;
+mod animations;
+mod config;
+mod engine;
+mod ipc;
+
+use args::Args;
+use animations::AnimationType;
+use engine::WallpaperEngine;
+use ipc::{IpcCommand, try_connect, start_listener};
+
+fn print_animation_list() {
+    println!("🎬 Available Animations:");
+    println!("  • fade • wipe • split • center • outer • pixel • dissolve • glitch • random");
+    println!("\n⏱️  Duration: -a 0.1 to 3.0 (seconds)");
+    println!("💡 Usage:\n   vivid-engine                    # Start daemon\n   vivid-engine /path.jpg        # Change wallpaper\n   vivid-engine -a center -a 1.0 # Set anim + duration");
+}
+
+fn main() {
+    let args = Args::parse();
+
+    // Handle -a list
+    if let Some(arg) = &args.animation {
+        if arg.to_lowercase() == "list" {
+            print_animation_list();
+            return;
+        }
+    }
+
+    // ✅ CLIENT MODE: Try to connect to existing daemon
+    if args.file.is_some() || args.animation.is_some() {
+        if try_connect().is_some() {
+            let cfg = config::load();
+            let cmd = if let Some(path) = &args.file {
+                let anim = args.animation.as_ref()
+                    .filter(|a| !config::is_duration_str(a))
+                    .cloned().unwrap_or(cfg.animation);
+                let dur = args.animation.as_ref()
+                    .and_then(|a| if config::is_duration_str(a) { a.parse().ok() } else { None })
+                    .unwrap_or(cfg.duration);
+                IpcCommand::SetWallpaper { path: path.clone(), animation: anim, duration: dur }
+            } else if let Some(anim_arg) = &args.animation {
+                if config::is_duration_str(anim_arg) {
+                    IpcCommand::SetDuration { seconds: anim_arg.parse().unwrap() }
+                } else {
+                    IpcCommand::SetAnimation { name: anim_arg.clone() }
+                }
+            } else {
+                IpcCommand::GetStatus
+            };
+
+            match ipc::send_command(&cmd) {
+                Ok(resp) => { println!("{}", resp); return; }
+                Err(e) => { eprintln!("❌ IPC error: {}", e); std::process::exit(1); }
+            }
+        }
+    }
+
+    // ✅ DAEMON MODE
+    println!("🚀 Starting Vivid Engine daemon...");
+    let mut engine = match WallpaperEngine::new() {
+        Ok(e) => e,
+        Err(e) => { eprintln!("❌ Wayland init failed: {}", e); std::process::exit(1); }
+    };
+
+    // Load saved wallpaper on startup
+    let cfg = config::load();
+    if let Some(path) = &cfg.last_wallpaper {
+        if std::path::Path::new(path).exists() {
+            if WallpaperEngine::is_video(path) {
+                engine.start_video_thread(path);
+            } else {
+                let anim = AnimationType::from_name(&cfg.animation);
+                let _ = engine.display_with_animation(path, anim, cfg.duration);
+            }
+        }
+    }
+
+    let listener: Option<UnixListener> = match start_listener() {
+        Ok(l) => { println!("🔌 IPC socket ready"); Some(l) }
+        Err(e) => { eprintln!("⚠️ IPC socket error: {}", e); None }
+    };
+
+    println!("🌟 Daemon running. Press Ctrl+C to exit.");
+
+    // ✅ MAIN LOOP
+    loop {
+        // 1. Render video frames if active
+        engine.render_video_frame();
+
+        // 2. Handle IPC commands (non-blocking)
+        if let Some(ref listener) = listener {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).ok();
+                    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                    let mut reader = BufReader::new(&stream);
+                    let mut req = String::new();
+                    if reader.read_line(&mut req).is_ok() && !req.trim().is_empty() {
+                        if let Some(cmd) = IpcCommand::parse(&req) {
+                            let resp = engine.handle_ipc_command(cmd);
+                            let mut writer = BufWriter::new(&stream);
+                            let _ = writer.write_all(resp.as_bytes());
+                            let _ = writer.write_all(b"\n");
+                            let _ = writer.flush();
+                        }
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                _ => {}
+            }
+        }
+
+        // 3. Dispatch Wayland events (keeps compositor alive)
+        engine.dispatch();
+        thread::sleep(Duration::from_millis(16));
+    }
+}
+
+
+======================================================================
+📂 FILE: ./src/video_player.rs
+======================================================================
+
+use std::process::{Command, Stdio};
+use std::io::Read;
+use wayland_client::Main;
+use wayland_client::protocol::wl_surface::WlSurface;
+use crate::wayland_state::WaylandState;
+
+pub struct VideoPlayer;
+
+impl VideoPlayer {
+    pub fn play(
+        state: &mut WaylandState,
+        surface: Main<WlSurface>,
+        file_path: &str,
+        width: u32,
+        height: u32,
+    ) {
+        println!("🎬 Playing video: {} ({}x{})", file_path, width, height);
+
+        // Check ffmpeg
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            eprintln!("❌ FFmpeg not found! Install: sudo pacman -S ffmpeg");
+            return;
+        }
+        
+        let mut ffmpeg = match Command::new("ffmpeg")
+            .args([
+                "-i", file_path,
+                "-vf", &format!("scale={}:{}:force_original_aspect_ratio=decrease,format=bgra", width, height),
+                "-f", "rawvideo",
+                "-pix_fmt", "bgra",
+                "-an",
+                "-"
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn() {
+                Ok(cmd) => cmd,
+                Err(e) => {
+                    eprintln!("❌ Failed to start ffmpeg: {}", e);
+                    return;
+                }
+            };
+        
+        let mut output = ffmpeg.stdout.take().expect("Failed to capture stdout");
+        let frame_size = (width * height * 4) as usize;
+        let mut buffer = vec![0u8; frame_size];
+        let mut frame_count = 0;
+        
+        // Pre-create a buffer to reuse (avoid leak)
+        let (mut shm_data, wl_buffer) = state.create_buffer(width, height);
+        
+        loop {
+            // Read one frame
+            let mut bytes_read = 0;
+            while bytes_read < frame_size {
+                match output.read(&mut buffer[bytes_read..frame_size]) {
+                    Ok(0) => break,
+                    Ok(n) => bytes_read += n,
+                    Err(_) => break,
+                }
+            }
+            
+            if bytes_read == 0 {
+                println!("✅ Video finished: {} frames", frame_count);
+                break;
+            }
+            
+            frame_count += 1;
+            
+            // Copy frame data to shm buffer
+            shm_data.copy_from_slice(&buffer);
+            
+            // Re-attach same buffer (no new allocation)
+            surface.attach(Some(&wl_buffer), 0, 0);
+            surface.damage(0, 0, i32::MAX, i32::MAX);
+            surface.commit();
+            state.dispatch();
+            
+            // ~60 FPS
+            std::thread::sleep(std::time::Duration::from_millis(16));
+            
+            if frame_count % 60 == 0 {
+                print!("\r🎬 Frame: {}", frame_count);
+                use std::io::Write;
+                std::io::stdout().flush().unwrap();
+            }
+        }
+        
+        let _ = ffmpeg.kill();
+        println!("\n✅ Video playback done. Last frame remains.");
+    }
+}
+
+
+======================================================================
+📂 FILE: ./src/config.rs
+======================================================================
+
+use std::fs;
+use std::path::PathBuf;
+
+pub const ANIMATIONS: &[&str] = &[
+    "fade", "wipe", "split", "center", "outer", "pixel", "dissolve", "glitch", "random"
+];
+
+pub const DEFAULT_DURATION: f32 = 0.5; // 0.5 seconds default
+pub const MIN_DURATION: f32 = 0.1;     // 100ms minimum
+pub const MAX_DURATION: f32 = 3.0;     // 3 seconds maximum
+
+#[derive(Clone, Debug)]
+pub struct AppConfig {
+    pub last_wallpaper: Option<String>,
+    pub animation: String,
+    pub duration: f32, // in seconds
+}
+
+fn config_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home).join(".config/vivid-engine")
+}
+
+pub fn load() -> AppConfig {
+    let path = config_dir().join("state.conf");
+    let content = fs::read_to_string(&path).unwrap_or_default();
+    
+    let mut last = None;
+    let mut anim = "fade".to_string();
+    let mut duration = DEFAULT_DURATION;
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.is_empty() { continue; }
+        
+        if let Some(val) = line.strip_prefix("LAST_WALLPAPER=") {
+            last = Some(val.trim().to_string());
+        } else if let Some(val) = line.strip_prefix("ANIMATION=") {
+            anim = val.trim().to_lowercase();
+        } else if let Some(val) = line.strip_prefix("DURATION=") {
+            if let Ok(d) = val.trim().parse::<f32>() {
+                duration = d.clamp(MIN_DURATION, MAX_DURATION);
+            }
+        }
+    }
+    
+    AppConfig { last_wallpaper: last, animation: anim, duration }
+}
+
+pub fn save(wallpaper: &str, animation: &str, duration: f32) {
+    let dir = config_dir();
+    fs::create_dir_all(&dir).ok();
+    
+    let content = format!(
+        "# Vivid Engine Config\n\
+         LAST_WALLPAPER={}\n\
+         ANIMATION={}\n\
+         DURATION={:.2}\n",
+        wallpaper, 
+        animation.to_lowercase(), 
+        duration.clamp(MIN_DURATION, MAX_DURATION)
+    );
+    fs::write(dir.join("state.conf"), content).ok();
+}
+
+// Helper: Check if string is a valid duration number
+pub fn is_duration_str(s: &str) -> bool {
+    s.parse::<f32>().is_ok()
+}
+
+
+======================================================================
+📂 FILE: ./src/engine.rs
+======================================================================
+
+use std::fs::File;
+use std::io::{Read, Write};
+use std::os::unix::io::AsRawFd;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use wayland_client::{
+    protocol::{
+        wl_buffer, wl_compositor, wl_output, wl_registry, wl_shm, wl_shm_pool, wl_surface,
+    },
+    Connection, Dispatch, QueueHandle, Proxy,
+};
+use wayland_protocols_wlr::layer_shell::v1::client::{
+    zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
+    zwlr_layer_surface_v1::{self, ZwlrLayerSurfaceV1},
+};
+
+use crate::animations::{render_frame, AnimationType};
+
+// ============================================================================
+// APP STATE
+// ============================================================================
+
+pub struct AppState {
+    compositor: Option<wl_compositor::WlCompositor>,
+    shm: Option<wl_shm::WlShm>,
+    layer_shell: Option<ZwlrLayerShellV1>,
+    output: Option<wl_output::WlOutput>,
+    pub width: u32,
+    pub height: u32,
+    surface: Option<wl_surface::WlSurface>,
+    layer_surface: Option<ZwlrLayerSurfaceV1>,
+    configured: bool,
+}
+
+impl AppState {
+    pub fn new() -> Self {
+        Self {
+            compositor: None, shm: None, layer_shell: None, output: None,
+            width: 1920, height: 1080, surface: None, layer_surface: None, configured: false,
+        }
+    }
+}
+
+// ============================================================================
+// DISPATCHERS
+// ============================================================================
+type RegEvent = <wl_registry::WlRegistry as Proxy>::Event;
+type OutEvent = <wl_output::WlOutput as Proxy>::Event;
+type LayEvent = <ZwlrLayerSurfaceV1 as Proxy>::Event;
+
+impl Dispatch<wl_registry::WlRegistry, ()> for AppState {
+    fn event(s: &mut Self, p: &wl_registry::WlRegistry, e: RegEvent, _: &(), _: &Connection, qh: &QueueHandle<Self>) {
+        if let RegEvent::Global { name, interface, version } = e {
+            match interface.as_str() {
+                "wl_compositor" => s.compositor = Some(p.bind(name, version.min(6), qh, ())),
+                "wl_shm"        => s.shm = Some(p.bind(name, 1, qh, ())),
+                "zwlr_layer_shell_v1" => s.layer_shell = Some(p.bind(name, version.min(4), qh, ())),
+                "wl_output"     if s.output.is_none() => s.output = Some(p.bind(name, version.min(4), qh, ())),
+                _ => {}
+            }
+        }
+    }
+}
+
+impl Dispatch<wl_output::WlOutput, ()> for AppState {
+    fn event(s: &mut Self, _: &wl_output::WlOutput, e: OutEvent, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        if let OutEvent::Mode { width, height, .. } = e { s.width = width as u32; s.height = height as u32; }
+    }
+}
+
+impl Dispatch<ZwlrLayerSurfaceV1, ()> for AppState {
+    fn event(s: &mut Self, p: &ZwlrLayerSurfaceV1, e: LayEvent, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        if let LayEvent::Configure { serial, width: w, height: h } = e {
+            if w > 0 { s.width = w; } if h > 0 { s.height = h; }
+            s.configured = true;
+            p.ack_configure(serial);
+        }
+    }
+}
+
+// Empty dispatchers
+macro_rules! empty_dispatch { ($t:ty) => {
+    impl Dispatch<$t, ()> for AppState {
+        fn event(_: &mut Self, _: &$t, _: <$t as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    }
+};}
+empty_dispatch!(wl_compositor::WlCompositor);
+empty_dispatch!(wl_shm::WlShm);
+empty_dispatch!(wl_shm_pool::WlShmPool);
+empty_dispatch!(wl_surface::WlSurface);
+empty_dispatch!(wl_buffer::WlBuffer);
+empty_dispatch!(ZwlrLayerShellV1);
+
+// ============================================================================
+// WALLPAPER ENGINE
+// ============================================================================
+
+pub struct WallpaperEngine {
+    conn: Connection,
+    eq: wayland_client::EventQueue<AppState>,
+    pub state: AppState,
+    _shm_file: Option<File>,
+    current_frame: Option<Vec<u8>>,
+    width: u32,
+    height: u32,
+    // ✅ NEW: Thread-safe video frame buffer
+    video_buffer: Arc<Mutex<Option<Vec<u8>>>>,
+    video_thread: Option<thread::JoinHandle<()>>,
+}
+
+impl WallpaperEngine {
+    pub fn is_video(path: &str) -> bool {
+        let ext = std::path::Path::new(path)
+            .extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        matches!(ext.as_str(), "mp4" | "mkv" | "webm" | "avi" | "mov" | "wmv" | "flv")
+    }
+
+    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let conn = Connection::connect_to_env()?;
+        let mut eq = conn.new_event_queue::<AppState>();
+        let qh = eq.handle();
+        let mut state = AppState::new();
+
+        let _reg = conn.display().get_registry(&qh, ());
+        eq.roundtrip(&mut state)?; eq.roundtrip(&mut state)?;
+
+        if state.compositor.is_none() || state.shm.is_none() || state.layer_shell.is_none() {
+            return Err("❌ Missing Wayland protocols".into());
+        }
+
+        println!("🖥️  Connected: {}x{}", state.width, state.height);
+            Ok(Self {
+                conn, eq, state, _shm_file: None,
+                current_frame: None,
+                width: 1920, height: 1080,
+                video_buffer: Arc::new(Mutex::new(None)),  // ✅ Add
+                video_thread: None,                        // ✅ Add
+            })
+    }
+    
+    fn capture_current_frame(&mut self) -> Option<Vec<u8>> {
+        // If we already have a frame, return clone
+        self.current_frame.as_ref().map(|f| f.clone())
+    }
+
+    fn setup_surface(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let qh = self.eq.handle();
+        let comp = self.state.compositor.as_ref().unwrap();
+        let shell = self.state.layer_shell.as_ref().unwrap();
+
+        let surf = comp.create_surface(&qh, ());
+        let layer = shell.get_layer_surface(&surf, self.state.output.as_ref(), zwlr_layer_shell_v1::Layer::Background, "vivid-engine".to_string(), &qh, ());
+        layer.set_anchor(zwlr_layer_surface_v1::Anchor::Top | zwlr_layer_surface_v1::Anchor::Bottom | zwlr_layer_surface_v1::Anchor::Left | zwlr_layer_surface_v1::Anchor::Right);
+        layer.set_exclusive_zone(-1);
+        layer.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
+
+        self.state.surface = Some(surf);
+        self.state.layer_surface = Some(layer);
+        self.state.surface.as_ref().unwrap().commit();
+
+        for _ in 0..10 {
+            self.eq.roundtrip(&mut self.state)?;
+            if self.state.configured { return Ok(()); }
+        }
+        Err("⚠️ Configure timeout".into())
+    }
+
+    fn create_buffer(&mut self, w: u32, h: u32) -> Result<(memmap2::MmapMut, wl_buffer::WlBuffer), Box<dyn std::error::Error>> {
+        let qh = self.eq.handle();
+        let shm = self.state.shm.as_ref().unwrap();
+        let stride = w * 4; let size = (stride * h) as usize;
+        let file = tempfile::tempfile()?; file.set_len(size as u64)?;
+        let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(file.as_raw_fd()) };
+        let pool = shm.create_pool(fd, size as i32, &qh, ());
+        let buf = pool.create_buffer(0, w as i32, h as i32, stride as i32, wl_shm::Format::Argb8888, &qh, ());
+        let mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };
+        self._shm_file = Some(file);
+        Ok((mmap, buf))
+    }
+
+    // ✅ FIXED: Proper pixel iteration
+    fn load_image_data(path: &str, w: u32, h: u32) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let img = image::open(path)?;
+        let img = img.resize_to_fill(w, h, image::imageops::FilterType::Lanczos3);
+        let rgba = img.to_rgba8();
+        
+        let mut bgra = vec![0u8; (w * h * 4) as usize];
+        
+        // ✅ Correct: iterate over pixels, not bytes
+        for (i, pixel) in rgba.pixels().enumerate() {
+            let idx = i * 4;
+            bgra[idx]     = pixel[2];  // B
+            bgra[idx + 1] = pixel[1];  // G
+            bgra[idx + 2] = pixel[0];  // R
+            bgra[idx + 3] = 255;       // A (opaque)
+        }
+        Ok(bgra)
+    }
+
+    pub fn display_with_animation(
+    &mut self, 
+    path: &str, 
+    anim: AnimationType, 
+    duration_seconds: f32
+) -> Result<(), Box<dyn std::error::Error>> {
+    self.setup_surface()?;
+    let (w, h) = (self.state.width, self.state.height);
+    self.width = w; self.height = h;
+    
+    // Capture old frame for smooth transition
+    let old_data = self.capture_current_frame()
+        .unwrap_or_else(|| vec![0u8; (w * h * 4) as usize]);
+    
+    let new_data = Self::load_image_data(path, w, h)?;
+    let (mut mmap, buf) = self.create_buffer(w, h)?;
+    
+    let anim_resolved = anim.resolve();
+    let total_frames = (duration_seconds * 30.0).clamp(3.0, 90.0) as usize;
+
+    for f in 0..=total_frames {
+        let t = f as f32 / total_frames as f32;
+        render_frame(&old_data, &new_data, t, w, h, &mut mmap, &anim_resolved);
+        
+        let surf = self.state.surface.as_ref().unwrap();
+        surf.attach(Some(&buf), 0, 0);
+        surf.damage_buffer(0, 0, w as i32, h as i32);
+        surf.commit();
+        self.conn.flush().ok();
+        
+        let frame_time = Duration::from_secs_f32(duration_seconds / total_frames as f32);
+        thread::sleep(frame_time);
+    }
+
+    // Save new frame as current for next transition
+    self.current_frame = Some(new_data.clone());
+    
+    // Final crisp frame
+    mmap.copy_from_slice(&new_data);
+    let surf = self.state.surface.as_ref().unwrap();
+    surf.attach(Some(&buf), 0, 0);
+    surf.damage_buffer(0, 0, w as i32, h as i32);
+    surf.commit();
+    self.conn.flush().ok();
+    
+    println!("✅ Animation complete!");
+    Ok(())
+}
+
+pub fn start_video_thread(&mut self, path: &str) {
+    let path = path.to_string();
+    let buf = self.video_buffer.clone();
+    let w = self.state.width; let h = self.state.height;
+
+    self.video_thread = Some(thread::spawn(move || {
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args([
+            "-hwaccel", "vaapi", "-hwaccel_device", "/dev/dri/renderD128",
+            "-i", &path,
+            "-vf", &format!("hwdownload,format=bgra,scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,format=bgra", w, h, w, h),
+            "-f", "rawvideo", "-pix_fmt", "bgra", "-an", "-stream_loop", "-1", "-"
+        ]).stdout(Stdio::piped()).stderr(Stdio::null());
+
+        let mut ffmpeg = cmd.spawn().or_else(|_| {
+            eprintln!("⚠️ VAAPI failed, falling back to CPU decode");
+            Command::new("ffmpeg").args([
+                "-i", &path,
+                "-vf", &format!("scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,format=bgra", w, h, w, h),
+                "-f", "rawvideo", "-pix_fmt", "bgra", "-an", "-stream_loop", "-1", "-"
+            ]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
+        }).expect("Failed to start ffmpeg");
+
+        let mut out = ffmpeg.stdout.take().unwrap();
+        let frame_sz = (w * h * 4) as usize;
+        let mut frame = vec![0u8; frame_sz];
+
+        loop {
+            if out.read_exact(&mut frame).is_err() { break; }
+            *buf.lock().unwrap() = Some(frame.clone());
+            thread::sleep(Duration::from_millis(33));
+        }
+        let _ = ffmpeg.kill();
+    }));
+}
+
+pub fn render_video_frame(&mut self) {
+    // 1️⃣ Lock leni & frame copy karo, lock turant release thai jashe
+    let frame_opt = self.video_buffer.lock().unwrap().take();
+
+    // 2️⃣ Lock gayu pachi `self` ne safely mutably borrow kari sako
+    if let Some(frame_data) = frame_opt {
+        let (mut mmap, buf) = match self.create_buffer(self.state.width, self.state.height) {
+            Ok(res) => res,
+            Err(e) => { eprintln!("❌ Buffer error: {}", e); return; }
+        };
+
+        mmap.copy_from_slice(&frame_data);
+        if let Some(surf) = self.state.surface.as_ref() {
+            surf.attach(Some(&buf), 0, 0);
+            surf.damage_buffer(0, 0, self.state.width as i32, self.state.height as i32);
+            surf.commit();
+        }
+    }
+}
+
+pub fn handle_ipc_command(&mut self, cmd: crate::ipc::IpcCommand) -> String {
+    use crate::ipc::IpcCommand;
+    match cmd {
+        IpcCommand::SetWallpaper { path, animation, duration } => {
+            if !std::path::Path::new(&path).exists() { return "❌ File not found".to_string(); }
+            
+            // Stop previous video if running
+            if let Some(handle) = self.video_thread.take() { let _ = handle.join(); }
+            *self.video_buffer.lock().unwrap() = None;
+
+            if Self::is_video(&path) {
+                self.start_video_thread(&path);
+                crate::config::save(&path, &animation, duration);
+                format!("✅ Video wallpaper started: {}", path)
+            } else {
+                let anim = AnimationType::from_name(&animation);
+                match self.display_with_animation(&path, anim, duration) {
+                    Ok(_) => {
+                        crate::config::save(&path, &animation, duration);
+                        format!("✅ Image wallpaper changed: {}", path)
+                    }
+                    Err(e) => format!("❌ Error: {}", e),
+                }
+            }
+        }
+        IpcCommand::SetAnimation { name } => {
+            let cfg = crate::config::load();
+            crate::config::save(cfg.last_wallpaper.as_deref().unwrap_or(""), &name, cfg.duration);
+            format!("✅ Animation set: {}", name)
+        }
+        IpcCommand::SetDuration { seconds } => {
+            let cfg = crate::config::load();
+            crate::config::save(cfg.last_wallpaper.as_deref().unwrap_or(""), &cfg.animation, seconds);
+            format!("✅ Duration set: {:.2}s", seconds)
+        }
+        IpcCommand::GetStatus => {
+            let cfg = crate::config::load();
+            format!("📊 Status:\n  Wallpaper: {:?}\n  Animation: {}\n  Duration: {:.2}s", 
+                cfg.last_wallpaper, cfg.animation, cfg.duration)
+        }
+    }
+}
+
+// Replace ONLY the `play_video` function in engine.rs:
+pub fn play_video(&mut self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    self.setup_surface()?;
+    let (w, h) = (self.state.width, self.state.height);
+    let (_, buf) = self.create_buffer(w, h)?;
+    let file = self._shm_file.as_ref().ok_or("SHM file missing")?;
+    let mut mmap = unsafe { memmap2::MmapMut::map_mut(file)? };
+
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args([
+        "-hwaccel", "vaapi", "-hwaccel_device", "/dev/dri/renderD128",
+        "-i", path,
+        "-vf", &format!("hwdownload,format=bgra,scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,format=bgra", w, h, w, h),
+        "-f", "rawvideo", "-pix_fmt", "bgra", "-an", "-stream_loop", "-1", "-"
+    ]).stdout(Stdio::piped()).stderr(Stdio::null());
+
+    let mut ffmpeg = cmd.spawn()
+        .or_else(|_| {
+            eprintln!("⚠️ VAAPI failed, falling back to CPU decode");
+            Command::new("ffmpeg").args([
+                "-i", path,
+                "-vf", &format!("scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,format=bgra", w, h, w, h),
+                "-f", "rawvideo", "-pix_fmt", "bgra", "-an", "-stream_loop", "-1", "-"
+            ]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
+        })?;
+
+    let mut out = ffmpeg.stdout.take().unwrap();
+    let frame_sz = (w * h * 4) as usize;
+    let mut frame = vec![0u8; frame_sz];
+    let mut count = 0;
+
+    loop {
+        if out.read_exact(&mut frame).is_err() { break; }
+        count += 1;
+        mmap.copy_from_slice(&frame);
+        
+        let surf = self.state.surface.as_ref().unwrap();
+        surf.attach(Some(&buf), 0, 0);
+        surf.damage_buffer(0, 0, w as i32, h as i32);
+        surf.commit();
+
+        // 🔥 CRITICAL: Dispatch Wayland events every frame so compositor keeps surface alive
+        self.dispatch();
+        self.conn.flush().ok();
+
+        thread::sleep(Duration::from_millis(33));
+        if count % 60 == 0 { print!("\r🎬 Frame: {}", count); std::io::stdout().flush().ok(); }
+    }
+    let _ = ffmpeg.kill();
+    println!("\n✅ Video playback ended");
+    Ok(())
+}
+
+    pub fn dispatch(&mut self) {
+        let _ = self.eq.dispatch_pending(&mut self.state);
+        let _ = self.conn.flush();
+    }
+}
+
+
+======================================================================
+📂 FILE: ./src/animations.rs
+======================================================================
+
+use rand::seq::SliceRandom;
+
+#[derive(Clone, Debug)]
+pub enum AnimationType {
+    Fade, Wipe, Split, Center, Outer, Pixel, Glitch, Dissolve, Random,
+}
+
+impl AnimationType {
+    pub fn from_name(name: &str) -> Self {
+        match name.to_lowercase().as_str() {
+            "wipe" => Self::Wipe, "split" => Self::Split,
+            "center" | "circle" => Self::Center, "outer" => Self::Outer,
+            "pixel" => Self::Pixel, "glitch" => Self::Glitch,
+            "dissolve" => Self::Dissolve, "random" => Self::Random,
+            _ => Self::Fade,
+        }
+    }
+    pub fn resolve(&self) -> Self {
+        if matches!(self, Self::Random) {
+            [Self::Fade, Self::Wipe, Self::Center, Self::Pixel, Self::Glitch, Self::Dissolve]
+                .choose(&mut rand::thread_rng()).cloned().unwrap_or(Self::Fade)
+        } else { self.clone() }
+    }
+}
+
+#[inline]
+fn hash_coord(x: u32, y: u32) -> u8 {
+    let h = x.wrapping_mul(12345).wrapping_add(y.wrapping_mul(67890));
+    (h ^ (h >> 8)) as u8
+}
+
+// ✅ KEY FIX: old_data should be ACTUAL previous wallpaper, not black!
+pub fn render_frame(old: &[u8], new: &[u8], progress: f32, width: u32, height: u32, out: &mut [u8], anim: &AnimationType) {
+    let w = width as usize; let h = height as usize;
+    let p = progress * progress * (3.0 - 2.0 * progress); // Smoothstep
+
+    for y in 0..h {
+        let row_off = y * w * 4;
+        for x in 0..w {
+            let i = row_off + x * 4;
+            match anim {
+                AnimationType::Fade => {
+                    let inv = 1.0 - p;
+                    out[i] = (old[i] as f32 * inv + new[i] as f32 * p) as u8;
+                    out[i+1] = (old[i+1] as f32 * inv + new[i+1] as f32 * p) as u8;
+                    out[i+2] = (old[i+2] as f32 * inv + new[i+2] as f32 * p) as u8;
+                    out[i+3] = 255;
+                }
+                AnimationType::Wipe => {
+                    let src = if (x as f32 / width as f32) < p { new } else { old };
+                    out[i..i+4].copy_from_slice(&src[i..i+4]);
+                }
+                AnimationType::Split => {
+                    let dx = (x as f32 - width as f32/2.0).abs();
+                    let src = if dx < (width as f32/2.0)*p { new } else { old };
+                    out[i..i+4].copy_from_slice(&src[i..i+4]);
+                }
+                AnimationType::Center => {
+                    let dx = (x as f32 - width as f32/2.0).powi(2);
+                    let dy = (y as f32 - height as f32/2.0).powi(2);
+                    let src = if (dx+dy).sqrt() < (width.max(height) as f32/2.0)*p { new } else { old };
+                    out[i..i+4].copy_from_slice(&src[i..i+4]);
+                }
+                AnimationType::Outer => {
+                    let dx = (x as f32 - width as f32/2.0).abs() / (width as f32/2.0);
+                    let dy = (y as f32 - height as f32/2.0).abs() / (height as f32/2.0);
+                    let src = if dx.max(dy) > (1.0-p) { new } else { old };
+                    out[i..i+4].copy_from_slice(&src[i..i+4]);
+                }
+                AnimationType::Pixel => {
+                    let bs = (32.0 * (1.0-p)).max(1.0) as u32;
+                    let src = if hash_coord(x as u32/bs, y as u32/bs) < (p*255.0) as u8 { new } else { old };
+                    out[i..i+4].copy_from_slice(&src[i..i+4]);
+                }
+                AnimationType::Dissolve => {
+                    let src = if hash_coord(x as u32, y as u32) < (p*255.0) as u8 { new } else { old };
+                    out[i..i+4].copy_from_slice(&src[i..i+4]);
+                }
+                AnimationType::Glitch => {
+                    let strength = if p < 0.7 { 1.0 - p/0.7 } else { 0.0 };
+                    let shift = (hash_coord(y as u32, 0) as f32 / 255.0 * width as f32 * strength) as i32;
+                    let sx = ((x as i32 + shift).rem_euclid(w as i32)) as usize;
+                    let si = row_off + sx * 4;
+                    let src = if hash_coord(x as u32, y as u32) > 180 { new } else { old };
+                    out[i..i+4].copy_from_slice(&src[si..si+4]);
+                }
+                _ => out[i..i+4].copy_from_slice(&new[i..i+4]),
+            }
+        }
+    }
+}
+
+
+======================================================================
+📂 FILE: ./src/image_renderer.rs
+======================================================================
+
+use wayland_client::Main;
+use wayland_client::protocol::wl_surface::WlSurface;
+use crate::wayland_state::WaylandState;
+
+pub struct ImageRenderer;
+
+impl ImageRenderer {
+    pub fn render(
+        state: &mut WaylandState,
+        surface: Main<WlSurface>,
+        file_path: &str,
+        width: u32,
+        height: u32,
+    ) {
+        let (mut data, buffer) = state.create_buffer(width, height);
+
+        let img = image::open(file_path).expect("Failed to load image");
+        let img = img.resize_exact(width, height, image::imageops::FilterType::Lanczos3);
+        let rgba = img.to_rgba8();
+
+        // Xrgb8888 format: bytes are B,G,R,A but we ignore alpha (set to 0xff)
+        for (i, pixel) in rgba.pixels().enumerate() {
+            let idx = i * 4;
+            data[idx] = pixel[2];     // B
+            data[idx + 1] = pixel[1]; // G
+            data[idx + 2] = pixel[0]; // R
+            data[idx + 3] = 0xff;     // A (ignored by Xrgb)
+        }
+
+        state.attach_buffer(&surface, &buffer);
+        println!("✅ Image displayed: {}", file_path);
+    }
+}
+
+
+======================================================================
+📂 FILE: ./src/args.rs
+======================================================================
+
+use clap::Parser;
+
+#[derive(Parser, Debug)]
+#[command(name = "vivid-engine", about = "Lightweight Wayland wallpaper engine", version)]
+pub struct Args {
+    #[arg(help = "Path to image/video (restores last if omitted)")]
+    pub file: Option<String>,
+
+    #[arg(
+        short, 
+        long,
+        value_name = "ANIM|DURATION",
+        help = "Set animation: name (fade/wipe/center/etc) OR duration in seconds (0.1-3.0)\n\
+                Use '-a list' to see all animations"
+    )]
+    pub animation: Option<String>,
+}
+
+
+======================================================================
+📂 FILE: ./src/wayland_state.rs
+======================================================================
+
+use wayland_client::{
+    protocol::{wl_buffer, wl_compositor, wl_shm, wl_surface::WlSurface},
+    Display, EventQueue, GlobalManager, Main,
+};
+use wayland_protocols::wlr::unstable::layer_shell::v1::client::{
+    zwlr_layer_shell_v1::{ZwlrLayerShellV1, Layer},
+    zwlr_layer_surface_v1::{Anchor, KeyboardInteractivity, ZwlrLayerSurfaceV1},
+};
+use std::fs::File;
+use std::os::unix::io::AsRawFd;
+
+// Wayland ne batavava mate ek empty struct banavi che
+struct LayerSurfaceHandler;
+
+impl wayland_client::Dispatch<ZwlrLayerSurfaceV1, ()> for LayerSurfaceHandler {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwlrLayerSurfaceV1,
+        event: <ZwlrLayerSurfaceV1 as wayland_client::Protocol>::Event,
+        _data: &(),
+        _conn: &wayland_client::Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        if let wayland_protocols::wlr::unstable::layer_shell::v1::client::zwlr_layer_surface_v1::Event::Configure { serial, .. } = event {
+            _proxy.ack_configure(serial);
+        }
+    }
+}
+
+pub struct WaylandState {
+    _display: Display,
+    event_queue: EventQueue,
+    compositor: Main<wl_compositor::WlCompositor>,
+    shm: Main<wl_shm::WlShm>,
+    shell: Main<ZwlrLayerShellV1>,
+    pub width: u32,
+    pub height: u32,
+    // FIX: Aa cheeze zinda rakhvi pade, nahi to compositor memory access nahi kari sake!
+    _shm_pool: Option<Main<wl_shm::WlShmPool>>,
+    _shm_file: Option<File>,
+    _layer_surface: Option<Main<ZwlrLayerSurfaceV1>>,
+}
+
+impl WaylandState {
+    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let display = Display::connect_to_env()?;
+        let mut event_queue = display.create_event_queue();
+        let attached_display = display.attach(event_queue.token());
+        let globals = GlobalManager::new(&attached_display);
+        
+        // Two roundtrips to get all globals
+        event_queue.sync_roundtrip(&mut (), |_, _, _| {})?;
+        event_queue.sync_roundtrip(&mut (), |_, _, _| {})?;
+
+        let compositor = globals.instantiate_exact::<wl_compositor::WlCompositor>(4)
+            .expect("Compositor not found");
+        let shm = globals.instantiate_exact::<wl_shm::WlShm>(1)
+            .expect("Shm not found");
+        let shell = globals.instantiate_exact::<ZwlrLayerShellV1>(2)
+            .expect("Layer shell version 2 not found");
+
+        Ok(Self {
+            _display: display,
+            event_queue,
+            compositor,
+            shm,
+            shell,
+            width: 1920,
+            height: 1080,
+            _shm_pool: None,
+            _shm_file: None,
+            _layer_surface: None,
+        })
+    }
+
+    pub fn set_resolution(&mut self, width: u32, height: u32) {
+        self.width = width;
+        self.height = height;
+    }
+
+    pub fn create_surface(&mut self, _output_name: &str, width: u32, height: u32) -> Main<WlSurface> {
+        let surface = self.compositor.create_surface();
+        
+        let layer_surface = self.shell.get_layer_surface(
+            &surface,
+            None, // let compositor choose output
+            Layer::Background,
+            "vivid-engine".to_string(),
+        );
+        
+        layer_surface.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
+        layer_surface.set_exclusive_zone(-1);  // -1 for background
+        layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
+        layer_surface.set_size(width, height);
+        
+        // FIX 1: v0.29 ma assign_handler no use thai che configure handle karva!
+        layer_surface.assign_handler(LayerSurfaceHandler);
+
+        // Layer surface ne store kari rakhvo pade
+        self._layer_surface = Some(layer_surface);
+
+        // Commit the surface
+        surface.commit();
+        
+        // Compositor ne events process karva de ane configure no wait kar!
+        self.event_queue.sync_roundtrip(&mut (), |_, _,_| {}).unwrap();
+        self.event_queue.sync_roundtrip(&mut (), |_, _,_| {}).unwrap();
+        
+        surface
+    }
+
+    pub fn create_buffer(&mut self, width: u32, height: u32) -> (memmap2::MmapMut, wl_buffer::WlBuffer) {
+        let stride = width * 4;
+        let size = (stride * height) as usize;
+        
+        let file = tempfile::tempfile().expect("Failed to create shm file");
+        file.set_len(size as u64).unwrap();
+        let mmap = unsafe { memmap2::MmapMut::map_mut(&file).expect("Failed to mmap") };
+        
+        let pool = self.shm.create_pool(file.as_raw_fd(), size as i32);
+        let buffer = pool.create_buffer(
+            0,
+            width as i32,
+            height as i32,
+            stride as i32,
+            wl_shm::Format::Xrgb8888, // Use Xrgb for simplicity
+        ).detach();
+        
+        // FIX 2: File & Pool ne drop nathi karva dvta, struct ma store kari rakhie chie
+        self._shm_pool = Some(pool);
+        self._shm_file = Some(file);
+        
+        (mmap, buffer)
+    }
+
+    pub fn attach_buffer(&mut self, surface: &WlSurface, buffer: &wl_buffer::WlBuffer) {
+        surface.attach(Some(buffer), 0, 0);
+        surface.damage(0, 0, i32::MAX, i32::MAX);
+        surface.commit();
+        self.dispatch();
+    }
+
+    pub fn dispatch(&mut self) {
+        // v0.29 ma flush separately nathi, e dispatch andar j thai jaay
+        let _ = self.event_queue.dispatch_pending(&mut (), |_, _, _| {});
+        let _ = self._display.flush();
+    }
+}
+
+
+======================================================================
+📂 FILE: ./src/main_simple.rs
+======================================================================
+
+use clap::Parser;
+use std::process::Command;
+use std::thread;
+use std::time::Duration;
+
+mod args;
+use args::Args;
+
+fn main() {
+    let args = Args::parse();
+    
+    if !std::path::Path::new(&args.file).exists() {
+        eprintln!("❌ File not found: {}", args.file);
+        std::process::exit(1);
+    }
+    
+    println!("🖼️ Setting wallpaper using wbg method...");
+    
+    // Method 1: Use wbg (if installed)
+    let status = Command::new("wbg")
+        .arg(&args.file)
+        .status();
+    
+    if status.is_ok() {
+        println!("✅ Wallpaper set via wbg");
+        
+        // Keep running
+        loop {
+            thread::sleep(Duration::from_secs(3600));
+        }
+        return;
+    }
+    
+    // Method 2: Use swaybg
+    let status = Command::new("swaybg")
+        .args(["-i", &args.file, "-m", "fill"])
+        .status();
+    
+    if status.is_ok() {
+        println!("✅ Wallpaper set via swaybg");
+        
+        loop {
+            thread::sleep(Duration::from_secs(3600));
+        }
+        return;
+    }
+    
+    // Method 3: Use hyprpaper (Hyprland)
+    let status = Command::new("hyprctl")
+        .args(["hyprpaper", "preload", &args.file])
+        .status();
+    
+    if status.is_ok() {
+        Command::new("hyprctl")
+            .args(["hyprpaper", "wallpaper", &format!("HDMI-1,{}", args.file)])
+            .status()
+            .ok();
+        println!("✅ Wallpaper set via hyprpaper");
+        
+        loop {
+            thread::sleep(Duration::from_secs(3600));
+        }
+        return;
+    }
+    
+    eprintln!("❌ No wallpaper tool found! Install: wbg, swaybg, or hyprpaper");
+}
+
