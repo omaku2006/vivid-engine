@@ -1,19 +1,19 @@
 use clap::Parser;
-use std::thread;
-use std::time::Duration;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::os::unix::net::UnixListener;
+use std::thread;
+use std::time::Duration;
 
-mod args;
 mod animations;
+mod args;
 mod config;
 mod engine;
 mod ipc;
 
-use args::Args;
 use animations::AnimationType;
+use args::Args;
 use engine::WallpaperEngine;
-use ipc::{IpcCommand, try_connect, start_listener};
+use ipc::{start_listener, try_connect, IpcCommand};
 
 fn print_animation_list() {
     println!("🎬 Available Animations:");
@@ -36,26 +36,51 @@ fn main() {
         if try_connect().is_some() {
             let cfg = config::load();
             let cmd = if let Some(path) = &args.file {
-                let anim = args.animation.as_ref()
+                let anim = args
+                    .animation
+                    .as_ref()
                     .filter(|a| !config::is_duration_str(a))
-                    .cloned().unwrap_or(cfg.animation);
-                let dur = args.animation.as_ref()
-                    .and_then(|a| if config::is_duration_str(a) { a.parse().ok() } else { None })
+                    .cloned()
+                    .unwrap_or(cfg.animation);
+                let dur = args
+                    .animation
+                    .as_ref()
+                    .and_then(|a| {
+                        if config::is_duration_str(a) {
+                            a.parse().ok()
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or(cfg.duration);
-                IpcCommand::SetWallpaper { path: path.clone(), animation: anim, duration: dur }
+                IpcCommand::SetWallpaper {
+                    path: path.clone(),
+                    animation: anim,
+                    duration: dur,
+                }
             } else if let Some(anim_arg) = &args.animation {
                 if config::is_duration_str(anim_arg) {
-                    IpcCommand::SetDuration { seconds: anim_arg.parse().unwrap() }
+                    IpcCommand::SetDuration {
+                        seconds: anim_arg.parse().unwrap(),
+                    }
                 } else {
-                    IpcCommand::SetAnimation { name: anim_arg.clone() }
+                    IpcCommand::SetAnimation {
+                        name: anim_arg.clone(),
+                    }
                 }
             } else {
                 IpcCommand::GetStatus
             };
 
             match ipc::send_command(&cmd) {
-                Ok(resp) => { println!("{}", resp); return; }
-                Err(e) => { eprintln!("❌ IPC error: {}", e); std::process::exit(1); }
+                Ok(resp) => {
+                    println!("{}", resp);
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("❌ IPC error: {}", e);
+                    std::process::exit(1);
+                }
             }
         }
     }
@@ -63,15 +88,17 @@ fn main() {
     println!("🚀 Starting Vivid Engine daemon...");
     let mut engine = match WallpaperEngine::new() {
         Ok(e) => e,
-        Err(e) => { eprintln!("❌ Wayland init failed: {}", e); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("❌ Wayland init failed: {}", e);
+            std::process::exit(1);
+        }
     };
 
     let cfg = config::load();
     if let Some(path) = &cfg.last_wallpaper {
         if std::path::Path::new(path).exists() {
             let anim = AnimationType::from_name(&cfg.animation);
-            
-            // ✅ FIX: Video start thayya pachhi transition show thay!
+
             if WallpaperEngine::is_video(path) {
                 engine.start_video_with_transition(path, anim, cfg.duration);
             } else {
@@ -81,8 +108,14 @@ fn main() {
     }
 
     let listener: Option<UnixListener> = match start_listener() {
-        Ok(l) => { println!("🔌 IPC socket ready"); Some(l) }
-        Err(e) => { eprintln!("⚠️ IPC socket error: {}", e); None }
+        Ok(l) => {
+            println!("🔌 IPC socket ready");
+            Some(l)
+        }
+        Err(e) => {
+            eprintln!("⚠️ IPC socket error: {}", e);
+            None
+        }
     };
 
     println!("🌟 Daemon running. Press Ctrl+C to exit.");

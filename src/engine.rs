@@ -2,15 +2,13 @@ use std::fs::File;
 use std::io::Read;
 use std::os::unix::io::AsRawFd;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::thread;
 use std::time::Duration;
 
 use wayland_client::{
-    protocol::{
-        wl_buffer, wl_compositor, wl_output, wl_registry, wl_shm, wl_shm_pool, wl_surface,
-    },
-    Connection, Dispatch, QueueHandle, Proxy,
+    protocol::{wl_buffer, wl_compositor, wl_output, wl_registry, wl_shm, wl_shm_pool, wl_surface},
+    Connection, Dispatch, Proxy, QueueHandle,
 };
 use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
@@ -19,84 +17,199 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 
 use crate::animations::{render_frame, AnimationType};
 
+// =============================================================================
+// Output & Surface structs
+// =============================================================================
+
+pub struct OutputInfo {
+    pub output: wl_output::WlOutput,
+    pub width: u32,
+    pub height: u32,
+}
+
+pub struct SurfaceInfo {
+    pub surface: wl_surface::WlSurface,
+    pub layer_surface: ZwlrLayerSurfaceV1,
+    pub width: u32,
+    pub height: u32,
+    pub configured: bool,
+    pub shm_buffer: Option<(memmap2::MmapMut, wl_buffer::WlBuffer)>,
+    pub current_frame: Option<Vec<u8>>,
+}
+
 pub struct AppState {
     pub compositor: Option<wl_compositor::WlCompositor>,
     pub shm: Option<wl_shm::WlShm>,
     pub layer_shell: Option<ZwlrLayerShellV1>,
-    pub output: Option<wl_output::WlOutput>,
-    pub width: u32,
-    pub height: u32,
-    pub surface: Option<wl_surface::WlSurface>,
-    pub layer_surface: Option<ZwlrLayerSurfaceV1>,
-    pub configured: bool,
+    pub outputs: Vec<OutputInfo>,
+    pub surfaces: Vec<SurfaceInfo>,
+    pub pending_configures: usize,
 }
 
 impl AppState {
     pub fn new() -> Self {
         Self {
-            compositor: None, shm: None, layer_shell: None, output: None,
-            width: 1920, height: 1080, surface: None, layer_surface: None, configured: false,
+            compositor: None,
+            shm: None,
+            layer_shell: None,
+            outputs: Vec::new(),
+            surfaces: Vec::new(),
+            pending_configures: 0,
         }
     }
 }
+
+// =============================================================================
+// Wayland Dispatch implementations
+// =============================================================================
 
 type RegEvent = <wl_registry::WlRegistry as Proxy>::Event;
 type OutEvent = <wl_output::WlOutput as Proxy>::Event;
 type LayEvent = <ZwlrLayerSurfaceV1 as Proxy>::Event;
 
 impl Dispatch<wl_registry::WlRegistry, ()> for AppState {
-    fn event(s: &mut Self, p: &wl_registry::WlRegistry, e: RegEvent, _: &(), _: &Connection, qh: &QueueHandle<Self>) {
-        if let RegEvent::Global { name, interface, version } = e {
+    fn event(
+        state: &mut Self,
+        registry: &wl_registry::WlRegistry,
+        event: RegEvent,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let RegEvent::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
             match interface.as_str() {
-                "wl_compositor" => s.compositor = Some(p.bind(name, version.min(6), qh, ())),
-                "wl_shm"        => s.shm = Some(p.bind(name, 1, qh, ())),
-                "zwlr_layer_shell_v1" => s.layer_shell = Some(p.bind(name, version.min(4), qh, ())),
-                "wl_output"     if s.output.is_none() => s.output = Some(p.bind(name, version.min(4), qh, ())),
+                "wl_compositor" => {
+                    state.compositor = Some(registry.bind(name, version.min(6), qh, ()));
+                }
+                "wl_shm" => {
+                    state.shm = Some(registry.bind(name, 1, qh, ()));
+                }
+                "zwlr_layer_shell_v1" => {
+                    state.layer_shell = Some(registry.bind(name, version.min(4), qh, ()));
+                }
+                "wl_output" => {
+                    let idx = state.outputs.len();
+                    let output = registry.bind(name, version.min(4), qh, idx);
+                    state.outputs.push(OutputInfo {
+                        output,
+                        width: 1920,
+                        height: 1080,
+                    });
+                }
                 _ => {}
             }
         }
     }
 }
-impl Dispatch<wl_output::WlOutput, ()> for AppState {
-    fn event(s: &mut Self, _: &wl_output::WlOutput, e: OutEvent, _: &(), _: &Connection, _: &QueueHandle<Self>) {
-        if let OutEvent::Mode { width, height, .. } = e { s.width = width as u32; s.height = height as u32; }
-    }
-}
-impl Dispatch<ZwlrLayerSurfaceV1, ()> for AppState {
-    fn event(s: &mut Self, p: &ZwlrLayerSurfaceV1, e: LayEvent, _: &(), _: &Connection, _: &QueueHandle<Self>) {
-        if let LayEvent::Configure { serial, width: w, height: h } = e {
-            if w > 0 { s.width = w; } if h > 0 { s.height = h; }
-            s.configured = true;
-            p.ack_configure(serial);
+
+impl Dispatch<wl_output::WlOutput, usize> for AppState {
+    fn event(
+        state: &mut Self,
+        _: &wl_output::WlOutput,
+        event: OutEvent,
+        idx: &usize,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let OutEvent::Mode { width, height, .. } = event {
+            if let Some(info) = state.outputs.get_mut(*idx) {
+                info.width = width as u32;
+                info.height = height as u32;
+            }
         }
     }
 }
 
-impl Dispatch<wl_compositor::WlCompositor, ()> for AppState { fn event(_: &mut Self, _: &wl_compositor::WlCompositor, _: <wl_compositor::WlCompositor as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {} }
-impl Dispatch<wl_shm::WlShm, ()> for AppState { fn event(_: &mut Self, _: &wl_shm::WlShm, _: <wl_shm::WlShm as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {} }
-impl Dispatch<wl_shm_pool::WlShmPool, ()> for AppState { fn event(_: &mut Self, _: &wl_shm_pool::WlShmPool, _: <wl_shm_pool::WlShmPool as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {} }
-impl Dispatch<wl_surface::WlSurface, ()> for AppState { fn event(_: &mut Self, _: &wl_surface::WlSurface, _: <wl_surface::WlSurface as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {} }
-impl Dispatch<wl_buffer::WlBuffer, ()> for AppState { fn event(_: &mut Self, _: &wl_buffer::WlBuffer, _: <wl_buffer::WlBuffer as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {} }
-impl Dispatch<ZwlrLayerShellV1, ()> for AppState { fn event(_: &mut Self, _: &ZwlrLayerShellV1, _: <ZwlrLayerShellV1 as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {} }
+impl Dispatch<ZwlrLayerSurfaceV1, usize> for AppState {
+    fn event(
+        state: &mut Self,
+        proxy: &ZwlrLayerSurfaceV1,
+        event: LayEvent,
+        idx: &usize,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let LayEvent::Configure {
+            serial,
+            width: w,
+            height: h,
+        } = event
+        {
+            if let Some(surf) = state.surfaces.get_mut(*idx) {
+                if w > 0 {
+                    surf.width = w as u32;
+                }
+                if h > 0 {
+                    surf.height = h as u32;
+                }
+                surf.configured = true;
+            }
+            state.pending_configures = state.pending_configures.saturating_sub(1);
+            proxy.ack_configure(serial);
+        }
+    }
+}
+
+macro_rules! stub_dispatch {
+    ($type:ty) => {
+        impl Dispatch<$type, ()> for AppState {
+            fn event(
+                _: &mut Self,
+                _: &$type,
+                _: <$type as Proxy>::Event,
+                _: &(),
+                _: &Connection,
+                _: &QueueHandle<Self>,
+            ) {
+            }
+        }
+    };
+}
+
+stub_dispatch!(wl_compositor::WlCompositor);
+stub_dispatch!(wl_shm::WlShm);
+stub_dispatch!(wl_shm_pool::WlShmPool);
+stub_dispatch!(wl_surface::WlSurface);
+stub_dispatch!(wl_buffer::WlBuffer);
+stub_dispatch!(ZwlrLayerShellV1);
+
+// =============================================================================
+// WallpaperEngine
+// =============================================================================
 
 pub struct WallpaperEngine {
     pub conn: Connection,
     pub eq: wayland_client::EventQueue<AppState>,
     pub state: AppState,
-    _shm_file: Option<File>,
-    current_frame: Option<Vec<u8>>,
-    width: u32,
-    height: u32,
-    pub video_buffer: Arc<Mutex<Option<Vec<u8>>>>,
-    video_thread: Option<thread::JoinHandle<()>>,
-    video_shm_buffer: Option<(memmap2::MmapMut, wl_buffer::WlBuffer)>,
+    _shm_files: Vec<File>,
+
+    // Video pipeline
+    video_width: u32,
+    video_height: u32,
+    video_rx: Option<Receiver<Vec<u8>>>,
+    video_return_tx: Option<SyncSender<Vec<u8>>>,
     video_child: Option<Child>,
+    video_thread: Option<thread::JoinHandle<()>>,
+    // Reusable scratch buffer for resizing frames (zero-allocation path)
+    video_resize_buf: Vec<u8>,
 }
 
 impl WallpaperEngine {
     pub fn is_video(path: &str) -> bool {
-        let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-        matches!(ext.as_str(), "mp4" | "mkv" | "webm" | "avi" | "mov" | "wmv" | "flv")
+        let ext = std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        matches!(
+            ext.as_str(),
+            "mp4" | "mkv" | "webm" | "avi" | "mov" | "wmv" | "flv"
+        )
     }
 
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
@@ -105,53 +218,121 @@ impl WallpaperEngine {
         let qh = eq.handle();
         let mut state = AppState::new();
         let _reg = conn.display().get_registry(&qh, ());
-        eq.roundtrip(&mut state)?; eq.roundtrip(&mut state)?;
+        eq.roundtrip(&mut state)?;
+        eq.roundtrip(&mut state)?;
+
         if state.compositor.is_none() || state.shm.is_none() || state.layer_shell.is_none() {
             return Err("❌ Missing Wayland protocols".into());
         }
-        println!("🖥️  Connected: {}x{}", state.width, state.height);
+
+        for _ in 0..10 {
+            eq.roundtrip(&mut state)?;
+            if !state.outputs.is_empty() {
+                break;
+            }
+        }
+
+        println!("🖥️  Found {} output(s)", state.outputs.len());
+
         Ok(Self {
-            conn, eq, state, _shm_file: None, current_frame: None,
-            width: 1920, height: 1080,
-            video_buffer: Arc::new(Mutex::new(None)),
-            video_thread: None,
-            video_shm_buffer: None,
+            conn,
+            eq,
+            state,
+            _shm_files: Vec::new(),
+            video_width: 1920,
+            video_height: 1080,
+            video_rx: None,
+            video_return_tx: None,
             video_child: None,
+            video_thread: None,
+            video_resize_buf: Vec::new(),
         })
     }
 
-    fn capture_current_frame(&mut self) -> Option<Vec<u8>> { self.current_frame.as_ref().map(|f| f.clone()) }
-
-    pub fn setup_surface(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.state.configured { return Ok(()); }
+    pub fn setup_surfaces(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if !self.state.surfaces.is_empty() {
+            return Ok(());
+        }
         let qh = self.eq.handle();
         let comp = self.state.compositor.as_ref().unwrap();
         let shell = self.state.layer_shell.as_ref().unwrap();
-        let surf = comp.create_surface(&qh, ());
-        let layer = shell.get_layer_surface(&surf, self.state.output.as_ref(), zwlr_layer_shell_v1::Layer::Background, "vivid-engine".to_string(), &qh, ());
-        layer.set_anchor(zwlr_layer_surface_v1::Anchor::Top | zwlr_layer_surface_v1::Anchor::Bottom | zwlr_layer_surface_v1::Anchor::Left | zwlr_layer_surface_v1::Anchor::Right);
-        layer.set_exclusive_zone(-1);
-        layer.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
-        self.state.surface = Some(surf);
-        self.state.layer_surface = Some(layer);
-        self.state.surface.as_ref().unwrap().commit();
-        for _ in 0..10 {
-            self.eq.roundtrip(&mut self.state)?;
-            if self.state.configured { return Ok(()); }
+
+        self.state.pending_configures = 0;
+        for (idx, info) in self.state.outputs.iter().enumerate() {
+            let surf = comp.create_surface(&qh, ());
+            let layer = shell.get_layer_surface(
+                &surf,
+                Some(&info.output),
+                zwlr_layer_shell_v1::Layer::Background,
+                "vivid-engine".to_string(),
+                &qh,
+                idx,
+            );
+            layer.set_anchor(
+                zwlr_layer_surface_v1::Anchor::Top
+                    | zwlr_layer_surface_v1::Anchor::Bottom
+                    | zwlr_layer_surface_v1::Anchor::Left
+                    | zwlr_layer_surface_v1::Anchor::Right,
+            );
+            layer.set_exclusive_zone(-1);
+            layer.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
+            surf.commit();
+
+            self.state.surfaces.push(SurfaceInfo {
+                surface: surf,
+                layer_surface: layer,
+                width: info.width,
+                height: info.height,
+                configured: false,
+                shm_buffer: None,
+                current_frame: None,
+            });
+            self.state.pending_configures += 1;
         }
-        Err("⚠️ Configure timeout".into())
+
+        for _ in 0..50 {
+            self.eq.roundtrip(&mut self.state)?;
+            if self.state.pending_configures == 0 {
+                break;
+            }
+        }
+
+        if let Some(first) = self.state.surfaces.first() {
+            self.video_width = first.width;
+            self.video_height = first.height;
+        }
+
+        println!(
+            "✅ Surfaces ready on {} monitor(s)",
+            self.state.surfaces.len()
+        );
+        Ok(())
     }
 
-    fn create_buffer(&mut self, w: u32, h: u32) -> Result<(memmap2::MmapMut, wl_buffer::WlBuffer), Box<dyn std::error::Error>> {
+    fn create_buffer(
+        &mut self,
+        w: u32,
+        h: u32,
+    ) -> Result<(memmap2::MmapMut, wl_buffer::WlBuffer), Box<dyn std::error::Error>> {
         let qh = self.eq.handle();
         let shm = self.state.shm.as_ref().unwrap();
-        let stride = w * 4; let size = (stride * h) as usize;
-        let file = tempfile::tempfile()?; file.set_len(size as u64)?;
+        let stride = w * 4;
+        let size = (stride * h) as usize;
+        let file = tempfile::tempfile()?;
+        file.set_len(size as u64)?;
         let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(file.as_raw_fd()) };
         let pool = shm.create_pool(fd, size as i32, &qh, ());
-        let buf = pool.create_buffer(0, w as i32, h as i32, stride as i32, wl_shm::Format::Argb8888, &qh, ());
+        let buf = pool.create_buffer(
+            0,
+            w as i32,
+            h as i32,
+            stride as i32,
+            wl_shm::Format::Argb8888,
+            &qh,
+            (),
+        );
         let mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };
-        self._shm_file = Some(file);
+        self._shm_files.push(file);
         Ok((mmap, buf))
     }
 
@@ -162,149 +343,392 @@ impl WallpaperEngine {
         let mut bgra = vec![0u8; (w * h * 4) as usize];
         for (i, pixel) in rgba.pixels().enumerate() {
             let idx = i * 4;
-            bgra[idx] = pixel[2]; bgra[idx + 1] = pixel[1]; bgra[idx + 2] = pixel[0]; bgra[idx + 3] = 255;
+            bgra[idx] = pixel[2];
+            bgra[idx + 1] = pixel[1];
+            bgra[idx + 2] = pixel[0];
+            bgra[idx + 3] = 255;
         }
         Ok(bgra)
     }
 
-    fn extract_first_frame(&mut self, path: &str) -> Option<Vec<u8>> {
-        let w = self.state.width;
-        let h = self.state.height;
+    fn extract_first_frame(&mut self, path: &str, w: u32, h: u32) -> Option<Vec<u8>> {
         let mut cmd = Command::new("ffmpeg");
         cmd.args([
             "-i", path,
-            "-vf", &format!("scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,format=bgra", w, h, w, h),
+            "-vf",
+            &format!(
+                "scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,format=bgra",
+                w, h, w, h
+            ),
             "-vframes", "1",
-            "-f", "rawvideo", "-pix_fmt", "bgra", "-an", "-"
-        ]).stdout(Stdio::piped()).stderr(Stdio::null());
+            "-f", "rawvideo",
+            "-pix_fmt", "bgra",
+            "-an",
+            "-threads", "2",
+            "-",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
 
         let mut child = cmd.spawn().ok()?;
         let mut out = child.stdout.take()?;
         let mut buf = vec![0u8; (w * h * 4) as usize];
-        if out.read_exact(&mut buf).is_err() { return None; }
+        if out.read_exact(&mut buf).is_err() {
+            return None;
+        }
         let _ = child.wait();
         Some(buf)
     }
 
-    pub fn animate_transition(&mut self, new_data: Vec<u8>, anim: AnimationType, duration_seconds: f32) -> Result<(), Box<dyn std::error::Error>> {
-        self.setup_surface()?;
-        let (w, h) = (self.state.width, self.state.height);
-        self.width = w; self.height = h;
-        let old_data = self.capture_current_frame().unwrap_or_else(|| vec![0u8; (w * h * 4) as usize]);
-        let (mut mmap, buf) = self.create_buffer(w, h)?;
+    /// Resize raw BGRA into a pre-allocated destination (zero-allocation hot path)
+    fn resize_raw_bgra_into(
+        src: &[u8],
+        src_w: u32,
+        src_h: u32,
+        dst_w: u32,
+        dst_h: u32,
+        dst: &mut [u8],
+    ) {
+        if src_w == dst_w && src_h == dst_h {
+            dst.copy_from_slice(src);
+            return;
+        }
+        let sx_ratio = src_w as f32 / dst_w as f32;
+        let sy_ratio = src_h as f32 / dst_h as f32;
+
+        for y in 0..dst_h {
+            for x in 0..dst_w {
+                let sx = ((x as f32 + 0.5) * sx_ratio - 0.5).round() as i32;
+                let sy = ((y as f32 + 0.5) * sy_ratio - 0.5).round() as i32;
+                let sx = sx.clamp(0, src_w as i32 - 1) as u32;
+                let sy = sy.clamp(0, src_h as i32 - 1) as u32;
+                let s_idx = ((sy * src_w + sx) * 4) as usize;
+                let d_idx = ((y * dst_w + x) * 4) as usize;
+                dst[d_idx..d_idx + 4].copy_from_slice(&src[s_idx..s_idx + 4]);
+            }
+        }
+    }
+
+    fn build_ffmpeg_cmd(path: &str, w: u32, h: u32, fps: u32) -> Command {
+        let mut cmd = Command::new("ffmpeg");
+
+        // Auto-detect VAAPI (Intel/AMD iGPU). Decodes on GPU, outputs system RAM for our SHM path.
+        let vaapi_dev = "/dev/dri/renderD128";
+        if std::path::Path::new(vaapi_dev).exists() {
+            cmd.args(["-hwaccel", "vaapi", "-hwaccel_device", vaapi_dev]);
+        }
+
+        cmd.args([
+            "-stream_loop", "-1",
+            "-re",
+            "-i", path,
+            "-vf",
+            &format!(
+                "scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,format=bgra",
+                w, h, w, h
+            ),
+            "-r", &fps.to_string(),
+            "-f", "rawvideo",
+            "-pix_fmt", "bgra",
+            "-an",
+            "-threads", "2", // Cap software-decode threads
+            "-",
+        ]);
+
+        cmd
+    }
+
+    pub fn animate_transition(
+        &mut self,
+        new_data: Vec<u8>,
+        anim: AnimationType,
+        duration_seconds: f32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.setup_surfaces()?;
+
         let anim_resolved = anim.resolve();
         let total_frames = (duration_seconds * 60.0).clamp(3.0, 180.0) as usize;
 
+        let mut per_surface: Vec<(Vec<u8>, Vec<u8>, u32, u32)> =
+            Vec::with_capacity(self.state.surfaces.len());
+        for surf in &self.state.surfaces {
+            let w = surf.width;
+            let h = surf.height;
+            let old = surf
+                .current_frame
+                .as_ref()
+                .map(|f| {
+                    let mut v = vec![0u8; (w * h * 4) as usize];
+                    Self::resize_raw_bgra_into(
+                        f,
+                        self.video_width,
+                        self.video_height,
+                        w,
+                        h,
+                        &mut v,
+                    );
+                    v
+                })
+                .unwrap_or_else(|| vec![0u8; (w * h * 4) as usize]);
+            let mut new = vec![0u8; (w * h * 4) as usize];
+            Self::resize_raw_bgra_into(
+                &new_data,
+                self.video_width,
+                self.video_height,
+                w,
+                h,
+                &mut new,
+            );
+            per_surface.push((old, new, w, h));
+        }
+
+        let dims: Vec<(usize, u32, u32)> = self
+            .state
+            .surfaces
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.shm_buffer.is_none())
+            .map(|(i, s)| (i, s.width, s.height))
+            .collect();
+        for (idx, w, h) in dims {
+            if let Ok(b) = self.create_buffer(w, h) {
+                self.state.surfaces[idx].shm_buffer = Some(b);
+            }
+        }
+
         for f in 0..=total_frames {
             let t = f as f32 / total_frames as f32;
-            render_frame(&old_data, &new_data, t, w, h, &mut mmap, &anim_resolved);
-            let surf = self.state.surface.as_ref().unwrap();
-            surf.attach(Some(&buf), 0, 0);
-            surf.damage_buffer(0, 0, w as i32, h as i32);
-            surf.commit();
+
+            for (idx, surf) in self.state.surfaces.iter_mut().enumerate() {
+                let (ref old, ref new, w, h) = per_surface[idx];
+                let Some((ref mut mmap, ref buf)) = surf.shm_buffer else {
+                    continue;
+                };
+
+                render_frame(old, new, t, w, h, mmap, &anim_resolved);
+
+                surf.surface.attach(Some(buf), 0, 0);
+                surf.surface.damage_buffer(0, 0, w as i32, h as i32);
+                surf.surface.commit();
+            }
+
             self.conn.flush().ok();
-            let frame_time = Duration::from_secs_f32(duration_seconds / total_frames as f32);
-            thread::sleep(frame_time);
+            thread::sleep(Duration::from_secs_f32(
+                duration_seconds / total_frames as f32,
+            ));
         }
-        
-        self.current_frame = Some(new_data.clone());
-        mmap.copy_from_slice(&new_data);
-        let surf = self.state.surface.as_ref().unwrap();
-        surf.attach(Some(&buf), 0, 0);
-        surf.damage_buffer(0, 0, w as i32, h as i32);
-        surf.commit();
+
+        for (idx, surf) in self.state.surfaces.iter_mut().enumerate() {
+            let (_, ref new, w, h) = per_surface[idx];
+            if let Some((ref mut mmap, ref buf)) = surf.shm_buffer {
+                mmap.copy_from_slice(new);
+                surf.surface.attach(Some(buf), 0, 0);
+                surf.surface.damage_buffer(0, 0, w as i32, h as i32);
+                surf.surface.commit();
+            }
+            surf.current_frame = Some(new.clone());
+        }
         self.conn.flush().ok();
+
+        if let Some(first) = self.state.surfaces.first() {
+            self.video_width = first.width;
+            self.video_height = first.height;
+        }
+
         Ok(())
     }
 
-    pub fn display_with_animation(&mut self, path: &str, anim: AnimationType, duration_seconds: f32) -> Result<(), Box<dyn std::error::Error>> {
-        let new_data = Self::load_image_data(path, self.state.width, self.state.height)?;
+    pub fn display_with_animation(
+        &mut self,
+        path: &str,
+        anim: AnimationType,
+        duration_seconds: f32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (pw, ph) = if let Some(s) = self.state.surfaces.first() {
+            (s.width, s.height)
+        } else {
+            (1920, 1080)
+        };
+        let new_data = Self::load_image_data(path, pw, ph)?;
         self.animate_transition(new_data, anim, duration_seconds)
     }
 
     pub fn start_video_with_transition(&mut self, path: &str, anim: AnimationType, duration: f32) {
-        if let Some(first_frame) = self.extract_first_frame(path) {
+        let (pw, ph) = if let Some(s) = self.state.surfaces.first() {
+            (s.width, s.height)
+        } else {
+            (1920, 1080)
+        };
+        self.video_width = pw;
+        self.video_height = ph;
+
+        if let Some(first_frame) = self.extract_first_frame(path, pw, ph) {
             let _ = self.animate_transition(first_frame, anim, duration);
         }
-        self.start_video_thread(path);
+
+        // 🗑️ CRITICAL: don't keep the first frame in RAM — video streams fresh frames
+        for surf in &mut self.state.surfaces {
+            surf.current_frame = None;
+        }
+
+        self.start_video_thread(path, pw, ph);
     }
 
-    pub fn start_video_thread(&mut self, path: &str) {
-        let path = path.to_string();
-        let buf = self.video_buffer.clone();
-        let w = self.state.width;
-        let h = self.state.height;
+    pub fn start_video_thread(&mut self, path: &str, w: u32, h: u32) {
+        self.kill_video();
 
-        let mut cmd = Command::new("ffmpeg");
-        cmd.args([
-            "-stream_loop", "-1", "-re",
-            "-i", &path,
-            "-vf", &format!("scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,format=bgra", w, h, w, h),
-            "-f", "rawvideo", "-pix_fmt", "bgra", "-an", "-"
-        ]).stdout(Stdio::piped()).stderr(Stdio::inherit());
+        let path = path.to_string();
+        let (target_w, target_h, fps) = if is_on_battery() {
+            let tw = ((w / 2) | 1).max(640);
+            let th = ((h / 2) | 1).max(360);
+            (tw, th, 24)
+        } else {
+            (w, h, 60)
+        };
+
+        self.video_width = target_w;
+        self.video_height = target_h;
+        let frame_sz = (target_w * target_h * 4) as usize;
+
+        let (frame_tx, frame_rx) = sync_channel::<Vec<u8>>(1);
+        let (return_tx, return_rx) = sync_channel::<Vec<u8>>(2);
+
+        for _ in 0..2 {
+            let _ = return_tx.send(vec![0u8; frame_sz]);
+        }
+
+        self.video_rx = Some(frame_rx);
+        self.video_return_tx = Some(return_tx.clone());
+
+        let mut cmd = Self::build_ffmpeg_cmd(&path, target_w, target_h, fps);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::null());
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
-            Err(e) => { eprintln!("❌ Failed to start ffmpeg: {}", e); return; }
+            Err(e) => {
+                eprintln!("❌ Failed to start ffmpeg: {}", e);
+                return;
+            }
         };
 
         let out = child.stdout.take().expect("Failed to capture stdout");
         self.video_child = Some(child);
 
-        self.video_thread = Some(thread::spawn(move || {
+        self.video_thread = Some(std::thread::spawn(move || {
             let mut out = out;
-            let frame_sz = (w * h * 4) as usize;
-            let mut frame = vec![0u8; frame_sz];
-
             loop {
-                if out.read_exact(&mut frame).is_err() { break; }
-                *buf.lock().unwrap() = Some(frame.clone());
-                // ✅ FIX: Sleep REMOVED! FFmpeg -re handles pacing smoothly natively.
-                // Extra sleep was causing micro-jerk at loop points!
+                let mut frame = match return_rx.recv() {
+                    Ok(b) => b,
+                    Err(_) => break,
+                };
+                if out.read_exact(&mut frame).is_err() {
+                    break;
+                }
+                if frame_tx.send(frame).is_err() {
+                    break;
+                }
             }
         }));
     }
 
     pub fn render_video_frame(&mut self) {
-        // ✅ FIX: Simple, blind render. No VSync deadlock!
-        let frame_opt = self.video_buffer.lock().unwrap().take();
-        if frame_opt.is_none() { return; }
-        
-        let frame_data = frame_opt.unwrap();
-        if self.video_shm_buffer.is_none() {
-            if let Ok(buf) = self.create_buffer(self.state.width, self.state.height) {
-                self.video_shm_buffer = Some(buf);
-            } else { return; }
-        }
-        
-        if let Some((ref mut mmap, ref buf)) = self.video_shm_buffer {
-            mmap.copy_from_slice(&frame_data);
-            if let Some(surf) = self.state.surface.as_ref() {
-                surf.attach(Some(buf), 0, 0);
-                surf.damage_buffer(0, 0, self.state.width as i32, self.state.height as i32);
-                surf.commit();
-                self.conn.flush().ok();
-                let _ = self.eq.dispatch_pending(&mut self.state);
+        let frame_data = match self.video_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            Some(f) => f,
+            None => return,
+        };
+
+        let missing: Vec<(usize, u32, u32)> = self
+            .state
+            .surfaces
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.shm_buffer.is_none())
+            .map(|(i, s)| (i, s.width, s.height))
+            .collect();
+        for (idx, w, h) in missing {
+            if let Ok(b) = self.create_buffer(w, h) {
+                self.state.surfaces[idx].shm_buffer = Some(b);
             }
+        }
+
+        // Take scratch buffer out of self to avoid borrow issues in the loop
+        let mut scratch = std::mem::take(&mut self.video_resize_buf);
+
+        for idx in 0..self.state.surfaces.len() {
+            let surf = &mut self.state.surfaces[idx];
+            let Some((ref mut mmap, ref buf)) = surf.shm_buffer else {
+                continue;
+            };
+
+            if surf.width == self.video_width && surf.height == self.video_height {
+                mmap.copy_from_slice(&frame_data);
+            } else {
+                let needed = (surf.width * surf.height * 4) as usize;
+                if scratch.len() != needed {
+                    scratch.resize(needed, 0);
+                }
+                Self::resize_raw_bgra_into(
+                    &frame_data,
+                    self.video_width,
+                    self.video_height,
+                    surf.width,
+                    surf.height,
+                    &mut scratch,
+                );
+                let len = mmap.len().min(scratch.len());
+                mmap[..len].copy_from_slice(&scratch[..len]);
+            }
+
+            surf.surface.attach(Some(buf), 0, 0);
+            surf.surface
+                .damage_buffer(0, 0, surf.width as i32, surf.height as i32);
+            surf.surface.commit();
+        }
+
+        self.conn.flush().ok();
+        let _ = self.eq.dispatch_pending(&mut self.state);
+
+        // Put scratch back for next frame
+        self.video_resize_buf = scratch;
+
+        if let Some(tx) = &self.video_return_tx {
+            let _ = tx.send(frame_data);
+        }
+    }
+
+    pub fn kill_video(&mut self) {
+        self.video_rx = None;
+        self.video_return_tx = None;
+
+        if let Some(mut child) = self.video_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(t) = self.video_thread.take() {
+            let _ = t.join();
         }
     }
 
     pub fn handle_ipc_command(&mut self, cmd: crate::ipc::IpcCommand) -> String {
         use crate::ipc::IpcCommand;
         match cmd {
-            IpcCommand::SetWallpaper { path, animation, duration } => {
-                if !std::path::Path::new(&path).exists() { return "❌ File not found".to_string(); }
-                
-                if let Some(mut child) = self.video_child.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    if let Some(handle) = self.video_thread.take() {
-                        let _ = handle.join();
-                    }
+            IpcCommand::SetWallpaper {
+                path,
+                animation,
+                duration,
+            } => {
+                if !std::path::Path::new(&path).exists() {
+                    return "❌ File not found".to_string();
                 }
-                
-                *self.video_buffer.lock().unwrap() = None;
-                self.video_shm_buffer = None;
+
+                self.kill_video();
+
+                for surf in &mut self.state.surfaces {
+                    surf.current_frame = None;
+                    surf.shm_buffer = None;
+                }
+                self._shm_files.clear();
+                self.video_resize_buf.clear();
 
                 let anim = AnimationType::from_name(&animation);
                 if Self::is_video(&path) {
@@ -313,24 +737,41 @@ impl WallpaperEngine {
                     format!("✅ Video wallpaper started: {}", path)
                 } else {
                     match self.display_with_animation(&path, anim, duration) {
-                        Ok(_) => { crate::config::save(&path, &animation, duration); format!("✅ Image changed: {}", path) }
+                        Ok(_) => {
+                            crate::config::save(&path, &animation, duration);
+                            format!("✅ Image changed: {}", path)
+                        }
                         Err(e) => format!("❌ Error: {}", e),
                     }
                 }
             }
             IpcCommand::SetAnimation { name } => {
                 let cfg = crate::config::load();
-                crate::config::save(cfg.last_wallpaper.as_deref().unwrap_or(""), &name, cfg.duration);
+                crate::config::save(
+                    cfg.last_wallpaper.as_deref().unwrap_or(""),
+                    &name,
+                    cfg.duration,
+                );
                 format!("✅ Animation set: {}", name)
             }
             IpcCommand::SetDuration { seconds } => {
                 let cfg = crate::config::load();
-                crate::config::save(cfg.last_wallpaper.as_deref().unwrap_or(""), &cfg.animation, seconds);
+                crate::config::save(
+                    cfg.last_wallpaper.as_deref().unwrap_or(""),
+                    &cfg.animation,
+                    seconds,
+                );
                 format!("✅ Duration set: {:.2}s", seconds)
             }
             IpcCommand::GetStatus => {
                 let cfg = crate::config::load();
-                format!("📊 Status:\n  Wallpaper: {:?}\n  Animation: {}\n  Duration: {:.2}s", cfg.last_wallpaper, cfg.animation, cfg.duration)
+                format!(
+                    "📊 Status:\n  Wallpaper: {:?}\n  Animation: {}\n  Duration: {:.2}s\n  Monitors: {}",
+                    cfg.last_wallpaper,
+                    cfg.animation,
+                    cfg.duration,
+                    self.state.surfaces.len()
+                )
             }
         }
     }
@@ -339,4 +780,11 @@ impl WallpaperEngine {
         let _ = self.eq.dispatch_pending(&mut self.state);
         let _ = self.conn.flush();
     }
+}
+
+pub fn is_on_battery() -> bool {
+    std::fs::read_to_string("/sys/class/power_supply/BAT0/status")
+        .or_else(|_| std::fs::read_to_string("/sys/class/power_supply/BAT1/status"))
+        .map(|s| s.trim() == "Discharging")
+        .unwrap_or(false)
 }
